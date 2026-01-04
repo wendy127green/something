@@ -1,0 +1,704 @@
+# train_delta_iqa_nv12_structured.py
+# ---------------------------------
+# ✅ CPU-friendly
+# ✅ KADID structured pair sampling (I01_17_03.png -> ref/type/level)
+# ✅ NV12(YUV420) simulation from RGB (BT.601 limited/full)
+# ✅ Siamese Delta-IQA: (base, cand) -> predict Δ_improve
+# ✅ Robust delta transform: clip + asinh + z-norm
+# ✅ Two-phase training: freeze backbone -> unfreeze top
+# ✅ VALID is deterministic (fixed pairs + fixed crops per idx)  <<< fixes your "not saving pth" issue
+# ✅ Freeze BN (small batch stability)                           <<< fixes unfreeze instability
+# ✅ Lower LR at unfreeze                                        <<< fixes divergence
+# ✅ Save best + last + periodic                                 <<< avoids "no ckpt saved"
+# ✅ TensorBoard logs (Windows-safe path, no colon)
+
+import os
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import cv2
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.models import resnet50
+
+
+# =========================
+# Config
+# =========================
+@dataclass
+class CFG:
+    # paths
+    csv_path: str = r"/path/to/kadid_labels.csv"
+    img_root: str = r"/path/to/kadid10k"
+    img_col: str = "dist_rgb"  # CSV column of distorted image path (e.g., I01_17_03.png)
+
+    # crop / MIL
+    crop_size: int = 384
+    K: int = 2                  # CPU建议先2；稳定后可4
+    p_same_type: float = 0.90   # 更贴近调参（同退化类别的不同强度）
+
+    # training (CPU-friendly)
+    batch_size: int = 2
+    num_workers: int = 0        # Windows/CPU 常用0更稳
+    epochs: int = 40
+    freeze_epochs: int = 6      # phase1: freeze backbone
+    mos_warmup_epochs: int = 10 # phaseA: MOS权重=0，先学 halo/noise/texture
+
+    lr_head: float = 2e-4
+    lr_backbone: float = 2e-5
+    weight_decay: float = 1e-4
+    accum_steps: int = 4        # 梯度累积，等效更大 batch
+    device: str = "cpu"
+    seed: int = 42
+
+    # unfreeze stabilization
+    unfreeze_lr_head_scale: float = 0.5
+    unfreeze_lr_backbone_scale: float = 0.2
+
+    # NV12 simulation
+    yuv_range: str = "limited"  # "limited" or "full" (BT.601)
+
+    # labels
+    label_cols: Optional[List[str]] = None
+    label_dir: Optional[Dict[str, float]] = None      # +1 larger better, -1 smaller better
+    label_weights: Optional[Dict[str, float]] = None  # per-head weights (business priority)
+
+    # robust delta transform stats sampling
+    delta_stat_samples: int = 20000
+    clip_p: Tuple[float, float] = (1.0, 99.0)         # winsorize percentiles
+    asinh_scale_eps: float = 1e-3
+
+    # scheduler
+    use_plateau: bool = True
+    plateau_patience: int = 3
+    plateau_factor: float = 0.5
+
+    # logging / ckpt
+    use_tensorboard: bool = True
+    log_root: str = r"log\delta_iqa_structured"
+    ckpt_best: str = "delta_iqa_nv12_structured_best.pth"
+    ckpt_last: str = "delta_iqa_nv12_structured_last.pth"
+    save_every: int = 5  # save epoch_xxx every N epochs
+
+
+def _default_labels():
+    # 按你的 CSV 列名改/增删
+    label_cols = [
+        "halo_y_norm",
+        "noise_y_inc",
+        "noise_uv_inc",
+        "pseudo_texture",
+        "mos",
+    ]
+    # halo/noise/texture 越小越好 => dir=-1；mos 越大越好 => dir=+1
+    label_dir = {
+        "halo_y_norm": -1.0,
+        "noise_y_inc": -1.0,
+        "noise_uv_inc": -1.0,
+        "pseudo_texture": -1.0,
+        "mos": +1.0,
+    }
+    # 权重：主控 halo/noise/texture，MOS 弱监督防离谱
+    label_weights = {
+        "halo_y_norm": 1.0,
+        "noise_y_inc": 1.0,
+        "noise_uv_inc": 0.7,
+        "pseudo_texture": 1.0,
+        "mos": 0.1,
+    }
+    return label_cols, label_dir, label_weights
+
+
+def set_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+# =========================
+# KADID filename parser: I01_17_03.png -> ref_id=1, dist_type=17, level=3
+# =========================
+_kadid_re = re.compile(r"^I(\d+)_([0-9]+)_([0-9]+)$")
+
+
+def parse_kadid_name(path_or_name: str):
+    name = os.path.splitext(os.path.basename(path_or_name))[0]
+    m = _kadid_re.match(name)
+    if m is None:
+        raise ValueError(f"Bad KADID name: {path_or_name} (expect Ixx_yy_zz.png)")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+# =========================
+# Build structured groups for sampling
+# =========================
+def build_groups(df: pd.DataFrame, img_col: str):
+    ref_to_idxs: Dict[int, List[int]] = {}
+    ref_type_to_idxs: Dict[Tuple[int, int], List[int]] = {}
+    ref_to_types: Dict[int, set] = {}
+
+    refs, types, levels = [], [], []
+    for i, p in enumerate(df[img_col].astype(str).tolist()):
+        ref_id, t, lv = parse_kadid_name(p)
+        refs.append(ref_id); types.append(t); levels.append(lv)
+
+        ref_to_idxs.setdefault(ref_id, []).append(i)
+        ref_type_to_idxs.setdefault((ref_id, t), []).append(i)
+        ref_to_types.setdefault(ref_id, set()).add(t)
+
+    df = df.copy()
+    df["_ref_id"] = refs
+    df["_type"] = types
+    df["_level"] = levels
+
+    # filter groups with at least 2
+    ref_to_idxs = {r: idxs for r, idxs in ref_to_idxs.items() if len(idxs) >= 2}
+    ref_type_to_idxs = {k: idxs for k, idxs in ref_type_to_idxs.items() if len(idxs) >= 2}
+    ref_to_types = {r: sorted(list(ts)) for r, ts in ref_to_types.items() if r in ref_to_idxs}
+    ref_list = sorted(ref_to_idxs.keys())
+    return df, ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list
+
+
+def group_split_by_ref(df: pd.DataFrame, seed: int, train_ratio=0.9):
+    uniq = df["_ref_id"].unique()
+    rng = np.random.RandomState(seed)
+    rng.shuffle(uniq)
+    n_tr = int(len(uniq) * train_ratio)
+    tr_set = set(uniq[:n_tr])
+    return df[df["_ref_id"].isin(tr_set)].copy(), df[~df["_ref_id"].isin(tr_set)].copy()
+
+
+def sample_pair_indices(rng: np.random.RandomState, cfg: CFG,
+                        ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list):
+    ref_id = ref_list[rng.randint(0, len(ref_list))]
+
+    if rng.rand() < cfg.p_same_type:
+        cand_types = [t for t in ref_to_types[ref_id] if (ref_id, t) in ref_type_to_idxs]
+        if len(cand_types) > 0:
+            t = cand_types[rng.randint(0, len(cand_types))]
+            idxs = ref_type_to_idxs[(ref_id, t)]
+            a, b = rng.choice(idxs, size=2, replace=False)
+            return a, b
+
+    idxs = ref_to_idxs[ref_id]
+    a, b = rng.choice(idxs, size=2, replace=False)
+    return a, b
+
+
+# =========================
+# BT.601 RGB->YUV (fullres) + 4:2:0 simulate (NV12-ish)
+# =========================
+def bgr_to_yuv_bt601_fullres(bgr: np.ndarray, range_mode="limited"):
+    rgb = bgr[..., ::-1].astype(np.float32)
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+
+    if range_mode == "full":
+        Y = 0.299 * R + 0.587 * G + 0.114 * B
+        U = -0.168736 * R - 0.331264 * G + 0.5 * B + 128.0
+        V = 0.5 * R - 0.418688 * G - 0.081312 * B + 128.0
+    elif range_mode == "limited":
+        Y = 16.0 + (65.481 * R + 128.553 * G + 24.966 * B) / 255.0
+        U = 128.0 + (-37.797 * R - 74.203 * G + 112.0 * B) / 255.0
+        V = 128.0 + (112.0 * R - 93.786 * G - 18.214 * B) / 255.0
+    else:
+        raise ValueError(range_mode)
+
+    Y = np.clip(Y, 0, 255).astype(np.uint8)
+    U = np.clip(U, 0, 255).astype(np.uint8)
+    V = np.clip(V, 0, 255).astype(np.uint8)
+    return Y, U, V
+
+
+def yuv420_simulate_and_pack(Y: np.ndarray, U: np.ndarray, V: np.ndarray):
+    """simulate 4:2:0 then upsample back to full res, return 3ch float [0,1]"""
+    h, w = Y.shape
+    u_half = cv2.resize(U, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    v_half = cv2.resize(V, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    u_full = cv2.resize(u_half, (w, h), interpolation=cv2.INTER_LINEAR)
+    v_full = cv2.resize(v_half, (w, h), interpolation=cv2.INTER_LINEAR)
+    x = np.stack([Y, u_full, v_full], axis=0).astype(np.float32) / 255.0
+    return torch.from_numpy(x)  # (3,H,W)
+
+
+def random_crop_coords(rng, h: int, w: int, crop: int):
+    if h < crop or w < crop:
+        # fallback: center crop window (clamped)
+        y0 = max(0, (h - crop) // 2)
+        x0 = max(0, (w - crop) // 2)
+        y0 = min(y0, max(0, h - crop))
+        x0 = min(x0, max(0, w - crop))
+        return y0, x0
+    y0 = 0 if h == crop else rng.randint(0, h - crop + 1)
+    x0 = 0 if w == crop else rng.randint(0, w - crop + 1)
+    return y0, x0
+
+
+# =========================
+# Robust delta transform: clip + asinh
+# =========================
+def transform_delta_raw(delta_raw: np.ndarray,
+                        clip_lo: np.ndarray, clip_hi: np.ndarray,
+                        asinh_scale: np.ndarray):
+    d = np.clip(delta_raw, clip_lo, clip_hi)
+    d = np.arcsinh(d / (asinh_scale + 1e-6))
+    return d
+
+
+def estimate_delta_stats(df_tr: pd.DataFrame, cfg: CFG,
+                         ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list):
+    rng = np.random.RandomState(cfg.seed + 123)
+    y = df_tr[cfg.label_cols].astype(np.float32).values
+    dirs = np.array([cfg.label_dir[c] for c in cfg.label_cols], np.float32)
+
+    deltas = []
+    for _ in tqdm(range(cfg.delta_stat_samples), desc="stat(delta)", leave=False):
+        a, b = sample_pair_indices(rng, cfg, ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list)
+        base_i, cand_i = (a, b) if rng.rand() < 0.5 else (b, a)
+        d_raw = dirs * (y[cand_i] - y[base_i])  # improve-direction raw delta
+        deltas.append(d_raw)
+
+    deltas = np.stack(deltas, axis=0)  # (N,heads)
+
+    lo_p, hi_p = cfg.clip_p
+    clip_lo = np.percentile(deltas, lo_p, axis=0).astype(np.float32)
+    clip_hi = np.percentile(deltas, hi_p, axis=0).astype(np.float32)
+
+    d_clip = np.clip(deltas, clip_lo, clip_hi)
+    asinh_scale = np.maximum(d_clip.std(axis=0), cfg.asinh_scale_eps).astype(np.float32)
+
+    d_tr = transform_delta_raw(deltas, clip_lo, clip_hi, asinh_scale)
+    mean = d_tr.mean(axis=0).astype(np.float32)
+    std = np.maximum(d_tr.std(axis=0), 1e-3).astype(np.float32)
+    return mean, std, clip_lo, clip_hi, asinh_scale
+
+
+# =========================
+# Dataset: returns (x_base, x_cand, delta_norm, delta_raw_improve)
+# =========================
+class KADIDDeltaNV12Dataset(Dataset):
+    def __init__(self, df: pd.DataFrame, cfg: CFG,
+                 ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list,
+                 delta_mean, delta_std, clip_lo, clip_hi, asinh_scale,
+                 train: bool):
+        self.df = df.reset_index(drop=True)
+        self.cfg = cfg
+        self.train = train
+
+        self.paths = self.df[cfg.img_col].astype(str).tolist()
+        self.y_abs = self.df[cfg.label_cols].astype(np.float32).values  # per-image abs metrics
+
+        self.ref_to_idxs = ref_to_idxs
+        self.ref_type_to_idxs = ref_type_to_idxs
+        self.ref_to_types = ref_to_types
+        self.ref_list = ref_list
+
+        self.delta_mean = delta_mean.astype(np.float32)
+        self.delta_std = delta_std.astype(np.float32)
+        self.clip_lo = clip_lo.astype(np.float32)
+        self.clip_hi = clip_hi.astype(np.float32)
+        self.asinh_scale = asinh_scale.astype(np.float32)
+
+        self.dirs = np.array([cfg.label_dir[c] for c in cfg.label_cols], np.float32)
+
+        # RNG:
+        # - train: one rng for randomness
+        # - valid: deterministic per idx using base_seed + idx
+        self.rng = np.random.RandomState(cfg.seed + (0 if train else 999))
+        self.base_seed = cfg.seed + (0 if train else 999999)
+
+    def __len__(self):
+        return len(self.df)
+
+    def _load_patch_yuv(self, img_path: str, coords: List[Tuple[int, int]], rng):
+        full = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if full is None:
+            raise ValueError(f"Failed to read image: {img_path}")
+
+        # train-only flip augmentation
+        if self.train and rng.rand() < 0.5:
+            full = cv2.flip(full, 1)
+
+        xs = []
+        for (y0, x0) in coords:
+            patch = full[y0:y0+self.cfg.crop_size, x0:x0+self.cfg.crop_size]
+            Y, U, V = bgr_to_yuv_bt601_fullres(patch, self.cfg.yuv_range)
+            x = yuv420_simulate_and_pack(Y, U, V)
+            xs.append(x)
+        return torch.stack(xs, dim=0)  # (K,3,H,W)
+
+    def __getitem__(self, idx):
+        # ✅ VALID deterministic
+        rng = self.rng if self.train else np.random.RandomState(self.base_seed + int(idx))
+
+        a, b = sample_pair_indices(rng, self.cfg,
+                                   self.ref_to_idxs, self.ref_type_to_idxs, self.ref_to_types, self.ref_list)
+        base_i, cand_i = (a, b) if rng.rand() < 0.5 else (b, a)
+
+        base_rel = self.paths[base_i]
+        cand_rel = self.paths[cand_i]
+        base_path = os.path.join(self.cfg.img_root, base_rel)
+        cand_path = os.path.join(self.cfg.img_root, cand_rel)
+
+        # shared crop coords (based on base image size)
+        bgr = cv2.imread(base_path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError(f"Failed to read image: {base_path}")
+        h, w = bgr.shape[:2]
+        coords = [random_crop_coords(rng, h, w, self.cfg.crop_size) for _ in range(self.cfg.K)]
+
+        x_base = self._load_patch_yuv(base_path, coords, rng)
+        x_cand = self._load_patch_yuv(cand_path, coords, rng)
+
+        # delta labels (improve-direction raw)
+        d_raw = self.dirs * (self.y_abs[cand_i] - self.y_abs[base_i])  # (heads,)
+        d_tr = transform_delta_raw(d_raw, self.clip_lo, self.clip_hi, self.asinh_scale)
+        d_norm = (d_tr - self.delta_mean) / (self.delta_std + 1e-6)
+
+        return (x_base,
+                x_cand,
+                torch.from_numpy(d_norm.astype(np.float32)),
+                torch.from_numpy(d_raw.astype(np.float32)))
+
+
+# =========================
+# Model: Siamese encoder + fusion head
+# =========================
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+
+class YUVAdapter(nn.Module):
+    """learn a gentle mapping from (Y,U,V) to a 3ch space ResNet can digest"""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 3, kernel_size=1, bias=True)
+        self.bn = nn.BatchNorm2d(3)
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            self.conv.bias.zero_()
+            for c in range(3):
+                self.conv.weight[c, c, 0, 0] = 1.0
+
+    def forward(self, x):
+        x = self.bn(self.conv(x))
+        return torch.sigmoid(x)  # clamp to [0,1]
+
+
+class SiameseDeltaIQA(nn.Module):
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.adapter = YUVAdapter()
+
+        bb = resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
+        bb.fc = nn.Identity()
+        self.backbone = bb  # 2048
+
+        self.fuse = nn.Sequential(
+            nn.Linear(2048 * 4, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(1024, num_heads),
+        )
+
+    def encode(self, xk):
+        # xk: (B,K,3,H,W)
+        B, K, C, H, W = xk.shape
+        x = xk.view(B * K, C, H, W)
+        x = self.adapter(x)
+
+        mean = IMAGENET_MEAN.to(x.device)
+        std  = IMAGENET_STD.to(x.device)
+        x = (x - mean) / std
+
+        f = self.backbone(x)            # (B*K,2048)
+        f = f.view(B, K, -1).mean(dim=1)  # MIL mean pooling
+        return f
+
+    def forward(self, x_base, x_cand):
+        fb = self.encode(x_base)
+        fc = self.encode(x_cand)
+        d = fc - fb
+        feat = torch.cat([fc, fb, d, torch.abs(d)], dim=1)
+        out = self.fuse(feat)  # (B,heads) normalized delta space
+        return out
+
+
+def set_backbone_trainable(model: SiameseDeltaIQA, mode: str):
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+    if mode == "freeze_all":
+        return
+    if mode == "unfreeze_top":
+        for p in model.backbone.layer3.parameters():
+            p.requires_grad = True
+        for p in model.backbone.layer4.parameters():
+            p.requires_grad = True
+        return
+    if mode == "unfreeze_all":
+        for p in model.backbone.parameters():
+            p.requires_grad = True
+        return
+    raise ValueError(mode)
+
+
+def build_optimizer(model: SiameseDeltaIQA, cfg: CFG):
+    pg_head = list(model.adapter.parameters()) + list(model.fuse.parameters())
+    pg_bb = [p for p in model.backbone.parameters() if p.requires_grad]
+
+    params = [{"params": pg_head, "lr": cfg.lr_head}]
+    if len(pg_bb) > 0:
+        params.append({"params": pg_bb, "lr": cfg.lr_backbone})
+    return torch.optim.AdamW(params, weight_decay=cfg.weight_decay)
+
+
+def freeze_bn(module: nn.Module):
+    """Freeze BatchNorm stats/affine for small batch stability."""
+    if isinstance(module, nn.BatchNorm2d):
+        module.eval()
+        for p in module.parameters():
+            p.requires_grad = False
+
+
+def weighted_smooth_l1(pred, target, w):
+    loss = nn.functional.smooth_l1_loss(pred, target, reduction="none")
+    return (loss * w).mean()
+
+
+def get_epoch_weights(cfg: CFG, epoch: int) -> torch.Tensor:
+    """
+    ✅ Head schedule:
+      - epoch <= mos_warmup_epochs: MOS weight = 0
+      - after that: MOS weight = cfg.label_weights['mos'] (weak guardrail)
+    """
+    weights = []
+    for name in cfg.label_cols:
+        ww = float(cfg.label_weights.get(name, 1.0))
+        if name == "mos" and epoch <= cfg.mos_warmup_epochs:
+            ww = 0.0
+        weights.append(ww)
+    return torch.tensor(weights, dtype=torch.float32).view(1, -1).to(cfg.device)
+
+
+def train_one_epoch(model, loader, optimizer, w, cfg: CFG):
+    model.train()
+    # ✅ freeze BN every epoch (important after unfreeze)
+    model.apply(freeze_bn)
+
+    total, n = 0.0, 0
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, (xb, xc, d_norm, _) in enumerate(tqdm(loader, desc="train", leave=False), start=1):
+        xb = xb.to(cfg.device)
+        xc = xc.to(cfg.device)
+        d_norm = d_norm.to(cfg.device)
+
+        pred = model(xb, xc)
+        loss = weighted_smooth_l1(pred, d_norm, w)
+
+        loss = loss / cfg.accum_steps
+        loss.backward()
+
+        if step % cfg.accum_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        total += float(loss.item()) * cfg.accum_steps * xb.size(0)
+        n += xb.size(0)
+
+    # flush leftover grads
+    if (step % cfg.accum_steps) != 0:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    return total / max(n, 1)
+
+
+@torch.no_grad()
+def valid_one_epoch(model, loader, w, cfg: CFG):
+    model.eval()
+    model.apply(freeze_bn)  # keep BN frozen in eval too
+
+    total, n = 0.0, 0
+    for xb, xc, d_norm, _ in tqdm(loader, desc="valid", leave=False):
+        xb = xb.to(cfg.device)
+        xc = xc.to(cfg.device)
+        d_norm = d_norm.to(cfg.device)
+
+        pred = model(xb, xc)
+        loss = weighted_smooth_l1(pred, d_norm, w)
+
+        total += float(loss.item()) * xb.size(0)
+        n += xb.size(0)
+
+    return total / max(n, 1)
+
+
+def read_csv_robust(path: str) -> pd.DataFrame:
+    # try utf-8, utf-8-sig (Excel), then cp936 (Windows)
+    for enc in ("utf-8", "utf-8-sig", "cp936"):
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    # last resort
+    return pd.read_csv(path, encoding="latin1")
+
+
+def main():
+    cfg = CFG()
+    set_seed(cfg.seed)
+
+    if cfg.label_cols is None or cfg.label_dir is None or cfg.label_weights is None:
+        cols, dirs, ws = _default_labels()
+        cfg.label_cols = cols
+        cfg.label_dir = dirs
+        cfg.label_weights = ws
+
+    df = read_csv_robust(cfg.csv_path)
+
+    need = [cfg.img_col] + cfg.label_cols
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        raise ValueError(f"CSV missing columns: {miss}")
+
+    # groups + split
+    df, ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list = build_groups(df, cfg.img_col)
+    df_tr, df_va = group_split_by_ref(df, cfg.seed, train_ratio=0.9)
+    print(f"[split] by ref_id: train={len(df_tr)} valid={len(df_va)}")
+
+    # rebuild groups on train/valid separately
+    df_tr, tr_ref_to_idxs, tr_ref_type_to_idxs, tr_ref_to_types, tr_ref_list = build_groups(df_tr, cfg.img_col)
+    df_va, va_ref_to_idxs, va_ref_type_to_idxs, va_ref_to_types, va_ref_list = build_groups(df_va, cfg.img_col)
+
+    # delta stats from train only
+    delta_mean, delta_std, clip_lo, clip_hi, asinh_scale = estimate_delta_stats(
+        df_tr, cfg, tr_ref_to_idxs, tr_ref_type_to_idxs, tr_ref_to_types, tr_ref_list
+    )
+    print("[delta] mean:", delta_mean)
+    print("[delta] std :", delta_std)
+
+    ds_tr = KADIDDeltaNV12Dataset(
+        df_tr, cfg,
+        tr_ref_to_idxs, tr_ref_type_to_idxs, tr_ref_to_types, tr_ref_list,
+        delta_mean, delta_std, clip_lo, clip_hi, asinh_scale,
+        train=True
+    )
+    ds_va = KADIDDeltaNV12Dataset(
+        df_va, cfg,
+        va_ref_to_idxs, va_ref_type_to_idxs, va_ref_to_types, va_ref_list,
+        delta_mean, delta_std, clip_lo, clip_hi, asinh_scale,
+        train=False
+    )
+
+    dl_tr = DataLoader(ds_tr, batch_size=cfg.batch_size, shuffle=True,
+                       num_workers=cfg.num_workers, drop_last=True)
+    dl_va = DataLoader(ds_va, batch_size=cfg.batch_size, shuffle=False,
+                       num_workers=cfg.num_workers)
+
+    model = SiameseDeltaIQA(num_heads=len(cfg.label_cols)).to(cfg.device)
+
+    # tensorboard (Windows safe: your previous error was due to ":" in time; here we use %H%M%S)
+    writer = None
+    if cfg.use_tensorboard:
+        from torch.utils.tensorboard import SummaryWriter
+        from datetime import datetime
+        run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir = os.path.join(cfg.log_root, run_name)
+        os.makedirs(log_dir, exist_ok=True)
+        print("[tb] log_dir =", log_dir)
+        writer = SummaryWriter(log_dir=log_dir)
+        writer.add_text("cfg", str(cfg.__dict__))
+        writer.add_text("labels", str(cfg.label_cols))
+
+    best = 1e9
+
+    # phase1 freeze backbone
+    set_backbone_trainable(model, "freeze_all")
+    optimizer = build_optimizer(model, cfg)
+
+    scheduler = None
+    if cfg.use_plateau:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=cfg.plateau_factor, patience=cfg.plateau_patience
+        )
+
+    for ep in range(1, cfg.epochs + 1):
+        # phase2 unfreeze
+        if ep == cfg.freeze_epochs + 1:
+            set_backbone_trainable(model, "unfreeze_top")
+
+            # ✅ lower lr at unfreeze for stability
+            cfg.lr_head *= cfg.unfreeze_lr_head_scale
+            cfg.lr_backbone *= cfg.unfreeze_lr_backbone_scale
+
+            optimizer = build_optimizer(model, cfg)
+            if cfg.use_plateau:
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode="min", factor=cfg.plateau_factor, patience=cfg.plateau_patience
+                )
+            print("[phase] switched to unfreeze_top | lr_head=%.3g lr_backbone=%.3g" % (cfg.lr_head, cfg.lr_backbone))
+
+        # ✅ head schedule (MOS warmup)
+        w = get_epoch_weights(cfg, ep)
+
+        tr_loss = train_one_epoch(model, dl_tr, optimizer, w, cfg)
+        va_loss = valid_one_epoch(model, dl_va, w, cfg)
+
+        lrs = [pg["lr"] for pg in optimizer.param_groups]
+        mos_w = None
+        if "mos" in cfg.label_cols:
+            mos_w = float(w[0, cfg.label_cols.index("mos")].item())
+
+        print(f"Epoch {ep:03d} | train {tr_loss:.6f} | valid {va_loss:.6f} | lr {lrs} | mos_w={mos_w}")
+
+        if writer is not None:
+            writer.add_scalar("loss/train", tr_loss, ep)
+            writer.add_scalar("loss/valid", va_loss, ep)
+            for i, name in enumerate(cfg.label_cols):
+                writer.add_scalar(f"w/{name}", float(w[0, i].item()), ep)
+            for gi, lr in enumerate(lrs):
+                writer.add_scalar(f"lr/group{gi}", lr, ep)
+
+        if scheduler is not None:
+            scheduler.step(va_loss)
+
+        ckpt = {
+            "model": model.state_dict(),
+            "cfg": cfg.__dict__,
+            "label_cols": cfg.label_cols,
+            "delta_mean": delta_mean,
+            "delta_std": delta_std,
+            "clip_lo": clip_lo,
+            "clip_hi": clip_hi,
+            "asinh_scale": asinh_scale,
+        }
+
+        # ✅ always save LAST
+        torch.save(ckpt, cfg.ckpt_last)
+
+        # ✅ save periodic
+        if cfg.save_every > 0 and ep % cfg.save_every == 0:
+            torch.save(ckpt, f"delta_iqa_epoch_{ep:03d}.pth")
+
+        # ✅ save BEST
+        if va_loss < best:
+            best = va_loss
+            torch.save(ckpt, cfg.ckpt_best)
+            print(f"  -> saved BEST: {cfg.ckpt_best}")
+
+    if writer is not None:
+        writer.close()
+    print("Done. Best valid:", best)
+
+
+if __name__ == "__main__":
+    main()
