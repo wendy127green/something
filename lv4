@@ -1,0 +1,110 @@
+import os
+import re
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.models import resnet50
+
+
+# =========================
+# Config
+# =========================
+@dataclass
+class CFG:
+    # paths
+    csv_path: str = r"/path/to/kadid_labels.csv"
+    img_root: str = r"/path/to/kadid10k"
+    img_col: str = "dist_rgb"   # CSV column of distorted image path
+
+    # crop / MIL
+    crop_size: int = 384
+    K: int = 2                  # CPU建议先 2，稳定后可 4
+    p_same_type: float = 0.90   # 更贴调参（同退化类别强弱）
+
+    # training
+    batch_size: int = 2         # CPU小一点
+    num_workers: int = 0        # Windows/CPU 常用 0 更稳
+    epochs: int = 40
+    freeze_epochs: int = 6
+    lr_head: float = 2e-4
+    lr_backbone: float = 2e-5
+    weight_decay: float = 1e-4
+    accum_steps: int = 4        # 梯度累积，等效更大 batch
+    device: str = "cpu"         # 你说现在用 CPU
+    seed: int = 42
+
+    # NV12 simulation
+    yuv_range: str = "limited"  # "limited" or "full" (BT.601)
+
+    # labels you keep (must exist in CSV)
+    label_cols: List[str] = None
+
+    # direction: +1 means larger is better, -1 means smaller is better
+    label_dir: Dict[str, float] = None
+
+    # loss weights per head (business priority)
+    label_weights: Dict[str, float] = None
+
+    # robust delta transform stats sampling
+    delta_stat_samples: int = 20000
+    clip_p: Tuple[float, float] = (1.0, 99.0)   # winsorize percentiles
+    asinh_scale_eps: float = 1e-3
+
+    # scheduler
+    use_plateau: bool = True
+    plateau_patience: int = 3
+    plateau_factor: float = 0.5
+
+    # logging
+    use_tensorboard: bool = True
+    log_root: str = "log/delta_iqa_structured"
+
+
+def _default_labels():
+    # 你可以按你当前 CSV 改这几个
+    label_cols = [
+        "halo_y_norm",
+        "noise_y_inc",
+        "noise_uv_inc",
+        "pseudo_texture",
+        "mos",
+    ]
+    # halo/noise/texture 越小越好 => dir=-1；mos 越大越好 => dir=+1
+    label_dir = {
+        "halo_y_norm": -1.0,
+        "noise_y_inc": -1.0,
+        "noise_uv_inc": -1.0,
+        "pseudo_texture": -1.0,
+        "mos": +1.0,
+    }
+    # 权重：主控锐度/噪声的风险（halo/noise/texture），MOS弱监督防离谱
+    label_weights = {
+        "halo_y_norm": 1.0,
+        "noise_y_inc": 1.0,
+        "noise_uv_inc": 0.7,
+        "pseudo_texture": 1.0,
+        "mos": 0.1,
+    }
+    return label_cols, label_dir, label_weights
+
+
+def set_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+# =========================
+# KADID filename parser
