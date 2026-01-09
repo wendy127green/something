@@ -1,0 +1,11 @@
+python build_kadid_csv_full_route2.py \
+  --in_csv  /path/to/kadid_original.csv \
+  --out_csv /path/to/kadid_labels_full_route2.csv \
+  --img_root /path/to/kadid10k \
+  --dist_col dist_rgb \
+  --mos_col mos \
+  --crop 384 --K 4 \
+  --flat_grad_p 25 --flat_var_p 25 --flat_win 9 \
+  --sigma_y 1.2 --sigma_uv 1.0 \
+  --edge_p 92 --radius 3 --contrast_min 0.03 --sample_max 15000 \
+  --stats_json /path/to/kadid_labels_full_route2_stats.json
