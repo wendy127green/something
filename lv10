@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import json
+import hashlib
+from typing import Dict, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+
+# =========================================================
+# ✅ Config (你只需要改这里)
+# =========================================================
+IN_CSV  = r"/path/to/kadid_original.csv"                 # KADID自带csv（含 dist_img/ref_img/dmos/var）
+OUT_CSV = r"/path/to/kadid_labels_full_route2.csv"      # 你要输出的csv
+IMG_ROOT = r"/path/to/kadid10k"                          # 图片根目录（ref/dist都在这里）
+
+# KADID自带csv列名（按你文件实际列名改）
+DIST_COL = "dist_img"
+REF_COL  = "ref_img"
+DMOS_COL = "dmos"
+VAR_COL  = "var"
+
+# Patch / sampling
+CROP = 384
+K = 4
+
+# Flat mask params
+FLAT_GRAD_P = 25.0
+FLAT_VAR_P  = 25.0
+FLAT_WIN    = 9
+
+# Residual Gaussian sigma
+SIGMA_Y  = 1.2
+SIGMA_UV = 1.0
+
+# Ringing/edge params
+EDGE_P        = 92.0
+RADIUS        = 3
+CONTRAST_MIN  = 0.03
+
+# Speed / reproducibility
+SAMPLE_MAX = 15000     # 0 表示不采样，直接全跑
+SEED = 42
+
+# Save stats JSON (optional)
+STATS_JSON = r"/path/to/kadid_labels_full_route2_stats.json"  # "" 则不输出
+
+
+# =========================================================
+# Utils
+# =========================================================
+def stable_int_seed(s: str) -> int:
+    h = hashlib.md5(s.encode("utf-8")).hexdigest()
+    return int(h[:8], 16)
+
+def ensure_bgr(path: str) -> np.ndarray:
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Failed to read image: {path}")
+    return img
+
+def safe_percentile(x: np.ndarray, p: float) -> float:
+    x = x.reshape(-1)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return 0.0
+    return float(np.percentile(x, p))
+
+def mad_sigma(x: np.ndarray, eps: float = 1e-12) -> float:
+    """
+    Robust sigma estimate from MAD:
+      sigma ≈ 1.4826 * median(|x - median(x)|)
+    """
+    x = x.reshape(-1)
+    x = x[np.isfinite(x)]
+    if x.size < 16:
+        return 0.0
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    return float(1.4826 * mad + eps)
+
+def random_crop_coords(rng: np.random.RandomState, h: int, w: int, crop: int) -> Tuple[int, int]:
+    if h < crop or w < crop:
+        # center crop fallback
+        y0 = max(0, (h - crop) // 2)
+        x0 = max(0, (w - crop) // 2)
+        y0 = min(y0, max(0, h - crop))
+        x0 = min(x0, max(0, w - crop))
+        return int(y0), int(x0)
+    y0 = 0 if h == crop else rng.randint(0, h - crop + 1)
+    x0 = 0 if w == crop else rng.randint(0, w - crop + 1)
+    return int(y0), int(x0)
+
+
+# =========================================================
+# KADID filename parser
+# dist: I01_17_03.png -> ref_id=1, type=17, level=3
+# ref : I01.png       -> ref_id=1, type=0,  level=0
+# =========================================================
+_re_dist = re.compile(r"^I(\d+)_([0-9]+)_([0-9]+)$")
+_re_ref  = re.compile(r"^I(\d+)$")
+
+def parse_kadid_any(name_or_path: str) -> Tuple[int, int, int]:
+    name = os.path.splitext(os.path.basename(str(name_or_path)))[0]
+    m = _re_dist.match(name)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    m = _re_ref.match(name)
+    if m:
+        return int(m.group(1)), 0, 0
+    return -1, -1, -1
+
+
+# =========================================================
+# RGB -> YUV (BT.601 FULL) + NV12-like 4:2:0 simulate
+# =========================================================
+def bgr_to_yuv_bt601_full(bgr: np.ndarray):
+    rgb = bgr[..., ::-1].astype(np.float32)
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+
+    Y = 0.299 * R + 0.587 * G + 0.114 * B
+    U = -0.168736 * R - 0.331264 * G + 0.5 * B + 128.0
+    V = 0.5 * R - 0.418688 * G - 0.081312 * B + 128.0
+
+    Y = np.clip(Y, 0, 255).astype(np.uint8)
+    U = np.clip(U, 0, 255).astype(np.uint8)
+    V = np.clip(V, 0, 255).astype(np.uint8)
+    return Y, U, V
+
+def simulate_nv12_upsample_uv(Y: np.ndarray, U: np.ndarray, V: np.ndarray):
+    h, w = Y.shape
+    u_half = cv2.resize(U, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    v_half = cv2.resize(V, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    u_full = cv2.resize(u_half, (w, h), interpolation=cv2.INTER_LINEAR)
+    v_full = cv2.resize(v_half, (w, h), interpolation=cv2.INTER_LINEAR)
+    return Y, u_full.astype(np.uint8), v_full.astype(np.uint8)
+
+
+# =========================================================
+# Flat mask (low gradient + low local variance)
+# =========================================================
+def sobel_grad_f32(y_u8: np.ndarray) -> np.ndarray:
+    y = y_u8.astype(np.float32) / 255.0
+    gx = cv2.Sobel(y, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(y, cv2.CV_32F, 0, 1, ksize=3)
+    g = cv2.magnitude(gx, gy)
+    return g
+
+def local_var_f32(y_u8: np.ndarray, win: int) -> np.ndarray:
+    y = y_u8.astype(np.float32) / 255.0
+    k = (win, win)
+    mean = cv2.blur(y, k)
+    mean2 = cv2.blur(y * y, k)
+    var = np.maximum(mean2 - mean * mean, 0.0)
+    return var
+
+def build_flat_mask(y_u8: np.ndarray, flat_grad_p: float, flat_var_p: float, flat_win: int) -> np.ndarray:
+    g = sobel_grad_f32(y_u8)
+    v = local_var_f32(y_u8, flat_win)
+    thr_g = safe_percentile(g, flat_grad_p)
+    thr_v = safe_percentile(v, flat_var_p)
+    flat = (g <= thr_g) & (v <= thr_v)
+
+    # 保底：mask太小就放宽
+    if flat.mean() < 0.02:
+        thr_g2 = safe_percentile(g, min(flat_grad_p + 10.0, 60.0))
+        thr_v2 = safe_percentile(v, min(flat_var_p + 10.0, 60.0))
+        flat = (g <= thr_g2) & (v <= thr_v2)
+    return flat
+
+
+# =========================================================
+# Noise sigma via residual + MAD
+# =========================================================
+def gaussian_residual(img_f: np.ndarray, sigma: float) -> np.ndarray:
+    blur = cv2.GaussianBlur(img_f, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    return img_f - blur
+
+def compute_noise_sigmas(Y_u8, U_u8, V_u8, flat_mask, sigma_y: float, sigma_uv: float):
+    Yf = Y_u8.astype(np.float32) / 255.0
+    Uf = U_u8.astype(np.float32) / 255.0
+    Vf = V_u8.astype(np.float32) / 255.0
+
+    ry = gaussian_residual(Yf, sigma_y)
+    ru = gaussian_residual(Uf, sigma_uv)
+    rv = gaussian_residual(Vf, sigma_uv)
+
+    sy = mad_sigma(ry[flat_mask])
+    su = mad_sigma(ru[flat_mask])
+    sv = mad_sigma(rv[flat_mask])
+    suv = 0.5 * (su + sv)
+    return float(sy), float(suv)
+
+
+# =========================================================
+# Ringing proxy: edge-band LoG energy normalized by edge strength
+# =========================================================
+def local_contrast(y_f: np.ndarray, radius: int) -> np.ndarray:
+    k = 2 * radius + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    y_u8 = np.clip(y_f * 255.0, 0, 255).astype(np.uint8)
+    mx = cv2.dilate(y_u8, kernel)
+    mn = cv2.erode(y_u8, kernel)
+    c = (mx.astype(np.float32) - mn.astype(np.float32)) / 255.0
+    return c
+
+def compute_ringing_y(Y_u8: np.ndarray, edge_p: float, radius: int, contrast_min: float) -> float:
+    Yf = Y_u8.astype(np.float32) / 255.0
+    g = sobel_grad_f32(Y_u8)
+
+    thr = safe_percentile(g, edge_p)
+    edge = (g >= thr)
+
+    c = local_contrast(Yf, radius=radius)
+    edge = edge & (c >= contrast_min)
+    if edge.mean() < 0.001:
+        return 0.0
+
+    k = 2 * radius + 1
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    edge_u8 = edge.astype(np.uint8) * 255
+    band = (cv2.dilate(edge_u8, se, iterations=1) > 0)
+
+    lap = cv2.Laplacian(Yf, cv2.CV_32F, ksize=3)
+    num = float(np.mean(np.abs(lap)[band]))
+    den = float(np.mean(g[band]) + 1e-6)
+    return float(num / den)
+
+
+# =========================================================
+# Per-image metrics: K patches -> average
+# =========================================================
+def process_one_image(img_path: str) -> Dict[str, float]:
+    bgr = ensure_bgr(img_path)
+    h, w = bgr.shape[:2]
+
+    # 每张图固定随机种子，确保“可复现”
+    seed_base = stable_int_seed(os.path.basename(img_path)) ^ (SEED + 1337)
+    rng = np.random.RandomState(seed_base)
+
+    sigy_list, siguv_list, ring_list, flat_ratio_list = [], [], [], []
+    for _ in range(K):
+        y0, x0 = random_crop_coords(rng, h, w, CROP)
+        patch = bgr[y0:y0 + CROP, x0:x0 + CROP]
+
+        Y, U, V = bgr_to_yuv_bt601_full(patch)
+        Y, Uu, Vv = simulate_nv12_upsample_uv(Y, U, V)
+
+        flat = build_flat_mask(Y, FLAT_GRAD_P, FLAT_VAR_P, FLAT_WIN)
+        flat_ratio_list.append(float(flat.mean()))
+
+        sy, suv = compute_noise_sigmas(Y, Uu, Vv, flat, SIGMA_Y, SIGMA_UV)
+        ry = compute_ringing_y(Y, EDGE_P, RADIUS, CONTRAST_MIN)
+
+        sigy_list.append(sy)
+        siguv_list.append(suv)
+        ring_list.append(ry)
+
+    return {
+        "noise_y_sigma": float(np.mean(sigy_list)),
+        "noise_uv_sigma": float(np.mean(siguv_list)),
+        "ringing_y": float(np.mean(ring_list)),
+        "flat_ratio": float(np.mean(flat_ratio_list)),
+    }
+
+
+# =========================================================
+# Entry
+# =========================================================
+def main():
+    df = pd.read_csv(IN_CSV, encoding="utf-8", engine="python")
+
+    if DIST_COL not in df.columns:
+        raise ValueError(f"CSV missing DIST_COL={DIST_COL}. Available: {list(df.columns)}")
+
+    if REF_COL not in df.columns:
+        df[REF_COL] = ""
+    if DMOS_COL not in df.columns:
+        df[DMOS_COL] = np.nan
+    if VAR_COL not in df.columns:
+        df[VAR_COL] = np.nan
+
+    # sample for speed
+    if SAMPLE_MAX and SAMPLE_MAX > 0 and len(df) > SAMPLE_MAX:
+        df = df.sample(n=SAMPLE_MAX, random_state=SEED).reset_index(drop=True)
+
+    rows = []
+    for _, r in tqdm(df.iterrows(), total=len(df)):
+        dist_name = str(r[DIST_COL])
+        ref_name = str(r[REF_COL]) if REF_COL in r else ""
+
+        dist_path = dist_name if os.path.isabs(dist_name) else os.path.join(IMG_ROOT, dist_name)
+
+        ref_id, dist_type, level = parse_kadid_any(dist_name)
+
+        m = process_one_image(dist_path)
+
+        rows.append({
+            "dist_rgb": dist_name,   # 统一输出字段名
+            "ref_rgb": ref_name,
+            "dmos": float(r[DMOS_COL]) if pd.notna(r[DMOS_COL]) else np.nan,
+            "var": float(r[VAR_COL]) if pd.notna(r[VAR_COL]) else np.nan,
+            "_ref_id": int(ref_id),
+            "_type": int(dist_type),
+            "_level": int(level),
+            "noise_y_sigma": m["noise_y_sigma"],
+            "noise_uv_sigma": m["noise_uv_sigma"],
+            "ringing_y": m["ringing_y"],
+            "flat_ratio": m["flat_ratio"],
+        })
+
+    out = pd.DataFrame(rows)
+
+    # Windows/Excel/VSCode 友好：utf-8-sig
+    out.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    print("saved:", OUT_CSV)
+
+    if STATS_JSON:
+        stats = {}
+        for c in ["noise_y_sigma", "noise_uv_sigma", "ringing_y", "flat_ratio", "dmos", "var"]:
+            if c in out.columns:
+                x = out[c].astype(np.float32).values
+                stats[c] = {
+                    "mean": float(np.nanmean(x)),
+                    "std": float(np.nanstd(x)),
+                    "p1": float(np.nanpercentile(x, 1)),
+                    "p5": float(np.nanpercentile(x, 5)),
+                    "p50": float(np.nanpercentile(x, 50)),
+                    "p95": float(np.nanpercentile(x, 95)),
+                    "p99": float(np.nanpercentile(x, 99)),
+                }
+        meta = {
+            "IN_CSV": IN_CSV,
+            "IMG_ROOT": IMG_ROOT,
+            "DIST_COL": DIST_COL,
+            "REF_COL": REF_COL,
+            "DMOS_COL": DMOS_COL,
+            "VAR_COL": VAR_COL,
+            "CROP": CROP,
+            "K": K,
+            "FLAT_GRAD_P": FLAT_GRAD_P,
+            "FLAT_VAR_P": FLAT_VAR_P,
+            "FLAT_WIN": FLAT_WIN,
+            "SIGMA_Y": SIGMA_Y,
+            "SIGMA_UV": SIGMA_UV,
+            "EDGE_P": EDGE_P,
+            "RADIUS": RADIUS,
+            "CONTRAST_MIN": CONTRAST_MIN,
+            "SAMPLE_MAX": SAMPLE_MAX,
+            "SEED": SEED,
+        }
+        payload = {"meta": meta, "stats": stats}
+        os.makedirs(os.path.dirname(STATS_JSON), exist_ok=True) if os.path.dirname(STATS_JSON) else None
+        with open(STATS_JSON, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        print("saved stats:", STATS_JSON)
+
+
+if __name__ == "__main__":
+    main()
