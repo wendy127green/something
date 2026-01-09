@@ -1,0 +1,579 @@
+import os
+import re
+import json
+import argparse
+import hashlib
+from typing import Optional, Tuple, Dict, Any, List
+
+import cv2
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+
+# optional deps
+try:
+    import lpips as lpips_pkg
+    HAS_LPIPS = True
+except Exception:
+    HAS_LPIPS = False
+
+try:
+    import piq
+    HAS_PIQ = True
+except Exception:
+    HAS_PIQ = False
+
+
+# ============================================================
+# deterministic helpers
+# ============================================================
+def stable_int_seed(s: str) -> int:
+    h = hashlib.md5(s.encode("utf-8")).hexdigest()
+    return int(h[:8], 16)
+
+def stable_rng(s: str) -> np.random.RandomState:
+    return np.random.RandomState(stable_int_seed(s))
+
+
+# ============================================================
+# KADID parse: I01_17_03.png -> ref_id=1 type=17 level=3
+# ============================================================
+_kadid_re = re.compile(r"^I(\d+)_([0-9]+)_([0-9]+)$")
+
+def parse_kadid_dist_name(path_or_name: str) -> Tuple[int, int, int]:
+    name = os.path.splitext(os.path.basename(path_or_name))[0]
+    m = _kadid_re.match(name)
+    if m is None:
+        raise ValueError(f"Bad KADID dist name: {path_or_name} (expect Ixx_yy_zz.png)")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+def make_ref_filename(ref_id: int, ext: str = ".png") -> str:
+    return f"I{ref_id:02d}{ext}"
+
+def find_ref_path(ref_id: int, ref_dirs: List[str], exts=(".png", ".jpg", ".jpeg")) -> Optional[str]:
+    for ext in exts:
+        fname = make_ref_filename(ref_id, ext=ext)
+        for d in ref_dirs:
+            cand = os.path.join(d, fname)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+# ============================================================
+# BT.601 FULL range RGB->NV12 simulate
+# ============================================================
+def bgr_to_nv12_bt601_full(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    BT.601 FULL range:
+      Y = 0.299R + 0.587G + 0.114B
+      U = -0.168736R - 0.331264G + 0.5B + 128
+      V = 0.5R - 0.418688G - 0.081312B + 128
+    Return:
+      Y:  (H,W) uint8
+      UV: (H/2,W) uint8 interleaved (NV12)
+    """
+    rgb = bgr[..., ::-1].astype(np.float32)
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+
+    Y = 0.299 * R + 0.587 * G + 0.114 * B
+    U = -0.168736 * R - 0.331264 * G + 0.5 * B + 128.0
+    V = 0.5 * R - 0.418688 * G - 0.081312 * B + 128.0
+
+    Y = np.clip(Y, 0, 255).astype(np.uint8)
+    U = np.clip(U, 0, 255).astype(np.uint8)
+    V = np.clip(V, 0, 255).astype(np.uint8)
+
+    h, w = Y.shape
+    u_half = cv2.resize(U, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    v_half = cv2.resize(V, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+
+    uv = np.empty((h // 2, w), dtype=np.uint8)
+    uv[:, 0::2] = u_half
+    uv[:, 1::2] = v_half
+    return Y, uv
+
+
+# ============================================================
+# Robust noise sigma (MAD) + flat mask (low grad & low local var)
+# ============================================================
+def robust_mad_sigma(x: np.ndarray) -> float:
+    if x.size < 64:
+        return 0.0
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    return float(1.4826 * mad)
+
+def make_flat_mask(y_f: np.ndarray, grad_p=25.0, var_p=25.0, win=9) -> np.ndarray:
+    gx = cv2.Sobel(y_f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(y_f, cv2.CV_32F, 0, 1, ksize=3)
+    g = np.sqrt(gx * gx + gy * gy)
+
+    mu = cv2.blur(y_f, (win, win))
+    mu2 = cv2.blur(y_f * y_f, (win, win))
+    var = np.maximum(mu2 - mu * mu, 0.0)
+
+    g_thr = np.percentile(g, grad_p)
+    v_thr = np.percentile(var, var_p)
+
+    flat = (g <= g_thr) & (var <= v_thr)
+
+    # avoid border instability
+    flat[:2, :] = False; flat[-2:, :] = False
+    flat[:, :2] = False; flat[:, -2:] = False
+    return flat
+
+def noise_sigma_y_from_Y(Y_u8: np.ndarray, grad_p=25.0, var_p=25.0, win=9, sigma_y=1.2) -> Tuple[float, np.ndarray]:
+    y_f = Y_u8.astype(np.float32) / 255.0
+    flat = make_flat_mask(y_f, grad_p=grad_p, var_p=var_p, win=win)
+
+    base = cv2.GaussianBlur(y_f, (0, 0), sigma_y)
+    res = y_f - base
+    sig = robust_mad_sigma(res[flat].reshape(-1))
+    return sig, flat
+
+def noise_sigma_uv_from_UV(UV_u8: np.ndarray, flat_y: np.ndarray, sigma_uv=1.0) -> float:
+    u = UV_u8[:, 0::2]
+    v = UV_u8[:, 1::2]
+    hu, wu = u.shape
+    flat_uv = cv2.resize(flat_y.astype(np.uint8), (wu, hu), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    def _sigma(ch_u8: np.ndarray) -> float:
+        c = ch_u8.astype(np.float32) / 255.0
+        base = cv2.GaussianBlur(c, (0, 0), sigma_uv)
+        res = c - base
+        return robust_mad_sigma(res[flat_uv].reshape(-1))
+
+    su = _sigma(u)
+    sv = _sigma(v)
+    return float(0.5 * (su + sv))
+
+
+# ============================================================
+# Ringing metric: overshoot+undershoot along edge normal
+# smaller is better
+# ============================================================
+def ringing_metric_y_from_Y(
+    Y_u8: np.ndarray,
+    seed: int,
+    edge_p: float = 92.0,
+    radius: int = 3,
+    sample_max: int = 15000,
+    contrast_min: float = 0.03,
+) -> float:
+    rng = np.random.RandomState(seed)
+
+    y = Y_u8.astype(np.float32) / 255.0
+    gx = cv2.Sobel(y, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(y, cv2.CV_32F, 0, 1, ksize=3)
+    g = np.sqrt(gx * gx + gy * gy)
+
+    thr = np.percentile(g, edge_p)
+    ys, xs = np.where(g >= thr)
+    if len(xs) < 256:
+        return 0.0
+
+    if len(xs) > sample_max:
+        idx = rng.choice(len(xs), size=sample_max, replace=False)
+        ys, xs = ys[idx], xs[idx]
+
+    H, W = y.shape
+    r = radius
+    valid = (xs >= r) & (xs < W - r) & (ys >= r) & (ys < H - r)
+    ys, xs = ys[valid], xs[valid]
+    if len(xs) < 256:
+        return 0.0
+
+    total = 0.0
+    cnt = 0
+
+    for (yy, xx) in zip(ys, xs):
+        nx = float(gx[yy, xx])
+        ny = float(gy[yy, xx])
+        nrm = (nx * nx + ny * ny) ** 0.5 + 1e-8
+        nx /= nrm
+        ny /= nrm
+
+        prof = []
+        for t in range(-r, r + 1):
+            sx = int(round(xx + t * nx))
+            sy = int(round(yy + t * ny))
+            prof.append(float(y[sy, sx]))
+        prof = np.asarray(prof, dtype=np.float32)
+
+        left = float(prof[0])
+        right = float(prof[-1])
+        contrast = abs(right - left)
+
+        if contrast < contrast_min:
+            continue
+
+        base_lo = min(left, right)
+        base_hi = max(left, right)
+
+        over = max(0.0, float(prof.max()) - base_hi)
+        under = max(0.0, base_lo - float(prof.min()))
+
+        ring = (over + under) / (contrast + 1e-6)
+        total += ring
+        cnt += 1
+
+    return float(total / cnt) if cnt > 0 else 0.0
+
+
+# ============================================================
+# Patch sampling for big images (deterministic)
+# ============================================================
+def sample_patch_coords(rng: np.random.RandomState, H: int, W: int, crop: int, K: int) -> List[Tuple[int, int]]:
+    if crop <= 0:
+        return [(0, 0)]
+    if H < crop or W < crop:
+        # fall back to center crop (clamped)
+        y0 = max(0, (H - crop) // 2)
+        x0 = max(0, (W - crop) // 2)
+        y0 = min(y0, max(0, H - crop))
+        x0 = min(x0, max(0, W - crop))
+        return [(y0, x0)] * K
+    coords = []
+    for _ in range(K):
+        y0 = 0 if H == crop else rng.randint(0, H - crop + 1)
+        x0 = 0 if W == crop else rng.randint(0, W - crop + 1)
+        coords.append((y0, x0))
+    return coords
+
+def crop_bgr(bgr: np.ndarray, y0: int, x0: int, crop: int) -> np.ndarray:
+    if crop <= 0:
+        return bgr
+    return bgr[y0:y0+crop, x0:x0+crop]
+
+
+# ============================================================
+# Guardrails: LPIPS / DISTS (optional)
+# ============================================================
+def bgr_to_torch_rgb01(bgr: np.ndarray) -> torch.Tensor:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+    return t.unsqueeze(0)
+
+def ensure_same_hw(a: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    ha, wa = a.shape[:2]
+    hb, wb = b.shape[:2]
+    if (ha, wa) == (hb, wb):
+        return a, b
+    b2 = cv2.resize(b, (wa, ha), interpolation=cv2.INTER_AREA)
+    return a, b2
+
+def compute_lpips_and_dists(ref_bgr: np.ndarray, dist_bgr: np.ndarray,
+                            lpips_model=None, device="cpu",
+                            use_lpips=True, use_dists=True) -> Tuple[float, float]:
+    lp = float("nan")
+    ds = float("nan")
+    ref_bgr, dist_bgr = ensure_same_hw(ref_bgr, dist_bgr)
+
+    with torch.no_grad():
+        ref_t = bgr_to_torch_rgb01(ref_bgr).to(device)
+        dist_t = bgr_to_torch_rgb01(dist_bgr).to(device)
+
+        if use_lpips and HAS_LPIPS and lpips_model is not None:
+            lp = float(lpips_model(dist_t * 2 - 1, ref_t * 2 - 1).mean().item())
+
+        if use_dists and HAS_PIQ:
+            try:
+                if hasattr(piq, "DISTS"):
+                    d = piq.DISTS().to(device)
+                    ds = float(d(dist_t, ref_t).item())
+                elif hasattr(piq, "dists"):
+                    ds = float(piq.dists(dist_t, ref_t).item())
+            except Exception:
+                ds = float("nan")
+
+    return lp, ds
+
+
+# ============================================================
+# Compute metrics on one image by averaging K patches
+# ============================================================
+def compute_metrics_route2_full_on_image(
+    bgr: np.ndarray,
+    seed_str: str,
+    crop: int,
+    K: int,
+    # flat mask params
+    grad_p: float,
+    var_p: float,
+    win: int,
+    # residual blur
+    sigma_y: float,
+    sigma_uv: float,
+    # ringing params
+    edge_p: float,
+    radius: int,
+    sample_max: int,
+    contrast_min: float,
+) -> Tuple[float, float, float]:
+    rng = stable_rng(seed_str)
+    H, W = bgr.shape[:2]
+    coords = sample_patch_coords(rng, H, W, crop, K)
+
+    ny_list, nuv_list, ring_list = [], [], []
+
+    for (y0, x0) in coords:
+        patch = crop_bgr(bgr, y0, x0, crop)
+
+        Y, UV = bgr_to_nv12_bt601_full(patch)
+        ny, flat = noise_sigma_y_from_Y(Y, grad_p=grad_p, var_p=var_p, win=win, sigma_y=sigma_y)
+        nuv = noise_sigma_uv_from_UV(UV, flat, sigma_uv=sigma_uv)
+        ring = ringing_metric_y_from_Y(
+            Y,
+            seed=stable_int_seed(seed_str) ^ (y0 * 1000003 + x0),
+            edge_p=edge_p,
+            radius=radius,
+            sample_max=sample_max,
+            contrast_min=contrast_min,
+        )
+
+        ny_list.append(ny)
+        nuv_list.append(nuv)
+        ring_list.append(ring)
+
+    return float(np.mean(ny_list)), float(np.mean(nuv_list)), float(np.mean(ring_list))
+
+
+# ============================================================
+# Save stats json (help later normalization)
+# ============================================================
+def compute_column_stats(df: pd.DataFrame, cols: List[str]) -> Dict[str, Any]:
+    stats = {}
+    for c in cols:
+        x = pd.to_numeric(df[c], errors="coerce").dropna().values.astype(np.float64)
+        if x.size == 0:
+            continue
+        stats[c] = {
+            "mean": float(np.mean(x)),
+            "std": float(np.std(x) + 1e-12),
+            "p1": float(np.percentile(x, 1.0)),
+            "p5": float(np.percentile(x, 5.0)),
+            "p50": float(np.percentile(x, 50.0)),
+            "p95": float(np.percentile(x, 95.0)),
+            "p99": float(np.percentile(x, 99.0)),
+            "min": float(np.min(x)),
+            "max": float(np.max(x)),
+        }
+    return stats
+
+
+# ============================================================
+# CLI main
+# ============================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in_csv", type=str, required=True)
+    ap.add_argument("--out_csv", type=str, required=True)
+    ap.add_argument("--img_root", type=str, required=True)
+    ap.add_argument("--dist_col", type=str, default="dist_rgb")
+    ap.add_argument("--mos_col", type=str, default="mos")
+
+    ap.add_argument("--ref_dirs", type=str, default="",
+                    help="';' separated. If empty, try: img_root/reference_images ; img_root/ref ; img_root")
+
+    # big-image patching
+    ap.add_argument("--crop", type=int, default=384, help="Patch size. 0 means full image.")
+    ap.add_argument("--K", type=int, default=4, help="Number of patches per image (avg). CPU can start with 2.")
+
+    # flat mask params
+    ap.add_argument("--flat_grad_p", type=float, default=25.0)
+    ap.add_argument("--flat_var_p", type=float, default=25.0)
+    ap.add_argument("--flat_win", type=int, default=9)
+
+    # residual blur
+    ap.add_argument("--sigma_y", type=float, default=1.2)
+    ap.add_argument("--sigma_uv", type=float, default=1.0)
+
+    # ringing params
+    ap.add_argument("--edge_p", type=float, default=92.0)
+    ap.add_argument("--radius", type=int, default=3)
+    ap.add_argument("--contrast_min", type=float, default=0.03)
+    ap.add_argument("--sample_max", type=int, default=15000)
+
+    # speed
+    ap.add_argument("--max_side", type=int, default=0,
+                    help="If >0, downscale whole image for faster metrics when max(H,W)>max_side. 0=no downscale.")
+
+    # guardrails
+    ap.add_argument("--use_lpips", action="store_true")
+    ap.add_argument("--use_dists", action="store_true")
+    ap.add_argument("--device", type=str, default="cpu")
+
+    # stats json
+    ap.add_argument("--stats_json", type=str, default="",
+                    help="If set, save column stats to json for later normalization consistency.")
+
+    args = ap.parse_args()
+
+    df_in = pd.read_csv(args.in_csv, encoding="utf-8", engine="python")
+    if args.dist_col not in df_in.columns:
+        raise ValueError(f"Input CSV missing dist_col='{args.dist_col}'")
+
+    # ref dirs
+    if args.ref_dirs.strip():
+        ref_dirs = []
+        for part in args.ref_dirs.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if not os.path.isabs(part):
+                part = os.path.join(args.img_root, part)
+            ref_dirs.append(part)
+    else:
+        ref_dirs = [
+            os.path.join(args.img_root, "reference_images"),
+            os.path.join(args.img_root, "ref"),
+            args.img_root,
+        ]
+
+    # LPIPS init
+    lpips_model = None
+    if args.use_lpips:
+        if not HAS_LPIPS:
+            print("[warn] --use_lpips but lpips not installed. will output NaN.")
+        else:
+            lpips_model = lpips_pkg.LPIPS(net="alex").to(args.device).eval()
+
+    rows = []
+    miss_img = 0
+    miss_ref = 0
+
+    for _, r in tqdm(df_in.iterrows(), total=len(df_in), desc="build_csv_full_route2"):
+        dist_rel = str(r[args.dist_col])
+        dist_path = dist_rel if os.path.isabs(dist_rel) else os.path.join(args.img_root, dist_rel)
+        if not os.path.isfile(dist_path):
+            miss_img += 1
+            continue
+
+        # parse kadid naming
+        try:
+            ref_id, dist_type, level = parse_kadid_dist_name(dist_rel)
+        except Exception:
+            ref_id, dist_type, level = -1, -1, -1
+
+        # load
+        bgr = cv2.imread(dist_path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            miss_img += 1
+            continue
+
+        # optional downscale for speed (keeps deterministic)
+        if args.max_side > 0:
+            H, W = bgr.shape[:2]
+            m = max(H, W)
+            if m > args.max_side:
+                s = args.max_side / float(m)
+                nw = int(round(W * s))
+                nh = int(round(H * s))
+                bgr = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+
+        seed_str = os.path.basename(dist_rel)  # deterministic key
+
+        noise_y_sigma, noise_uv_sigma, ringing_y = compute_metrics_route2_full_on_image(
+            bgr=bgr,
+            seed_str=seed_str,
+            crop=args.crop,
+            K=args.K,
+            grad_p=args.flat_grad_p,
+            var_p=args.flat_var_p,
+            win=args.flat_win,
+            sigma_y=args.sigma_y,
+            sigma_uv=args.sigma_uv,
+            edge_p=args.edge_p,
+            radius=args.radius,
+            sample_max=args.sample_max,
+            contrast_min=args.contrast_min,
+        )
+
+        # optional guardrails vs reference
+        ref_rel_out = ""
+        lp = float("nan")
+        ds = float("nan")
+
+        ref_path = None
+        if ref_id > 0 and (args.use_lpips or args.use_dists):
+            ref_path = find_ref_path(ref_id, ref_dirs)
+            if ref_path is None:
+                miss_ref += 1
+            else:
+                ref_bgr = cv2.imread(ref_path, cv2.IMREAD_COLOR)
+                if ref_bgr is not None:
+                    if args.max_side > 0:
+                        H2, W2 = ref_bgr.shape[:2]
+                        m2 = max(H2, W2)
+                        if m2 > args.max_side:
+                            s2 = args.max_side / float(m2)
+                            nw2 = int(round(W2 * s2))
+                            nh2 = int(round(H2 * s2))
+                            ref_bgr = cv2.resize(ref_bgr, (nw2, nh2), interpolation=cv2.INTER_AREA)
+                    lp, ds = compute_lpips_and_dists(
+                        ref_bgr, bgr,
+                        lpips_model=lpips_model,
+                        device=args.device,
+                        use_lpips=args.use_lpips,
+                        use_dists=args.use_dists
+                    )
+                    try:
+                        ref_rel_out = os.path.relpath(ref_path, args.img_root)
+                    except Exception:
+                        ref_rel_out = ref_path
+
+        out: Dict[str, Any] = {
+            "dist_rgb": dist_rel,
+            "ref_rgb": ref_rel_out,
+            "ref_id": int(ref_id),
+            "dist_type": int(dist_type),
+            "level": int(level),
+
+            # ✅ main pseudo labels (smaller is better)
+            "noise_y_sigma": float(noise_y_sigma),
+            "noise_uv_sigma": float(noise_uv_sigma),
+            "ringing_y": float(ringing_y),
+
+            # optional guardrails (smaller is better)
+            "lpips": float(lp),
+            "dists": float(ds),
+
+            # record config for reproducibility
+            "yuv_range": "bt601_full",
+            "crop": int(args.crop),
+            "K": int(args.K),
+        }
+
+        if args.mos_col in df_in.columns:
+            try:
+                out["mos"] = float(r[args.mos_col])
+            except Exception:
+                out["mos"] = np.nan
+
+        rows.append(out)
+
+    df_out = pd.DataFrame(rows)
+
+    # Save UTF-8 (fix your previous encoding/binary issue)
+    os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
+    df_out.to_csv(args.out_csv, index=False, encoding="utf-8", lineterminator="\n")
+
+    print(f"[done] saved: {args.out_csv}")
+    print(f"[stat] input={len(df_in)} output={len(df_out)} missing_img={miss_img} missing_ref={miss_ref}")
+    print("[cols]", list(df_out.columns))
+
+    if args.stats_json:
+        cols_for_stats = ["noise_y_sigma", "noise_uv_sigma", "ringing_y", "lpips", "dists"]
+        if "mos" in df_out.columns:
+            cols_for_stats.append("mos")
+        stats = compute_column_stats(df_out, cols_for_stats)
+        with open(args.stats_json, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+        print(f"[stats] saved: {args.stats_json}")
+
+
+if __name__ == "__main__":
+    main()
