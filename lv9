@@ -1,0 +1,515 @@
+# train_delta_iqa_nv12_full_v3.py
+# Match new CSV columns: noise_y_sigma, noise_uv_sigma, ringing_y, (optional mos/lpips/dists)
+# Input: RGB files -> simulate NV12(YUV420) BT.601 FULL -> (Y,U,V) tensor -> ResNet50 Siamese Delta
+# Includes: structured sampling by (ref_id, dist_type), stable validation pairs, CPU-friendly training
+
+import os
+import re
+import time
+import math
+import hashlib
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import cv2
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.models import resnet50
+
+
+# =========================
+# Config
+# =========================
+@dataclass
+class CFG:
+    # paths
+    csv_path: str = r"/path/to/kadid_labels_full_route2.csv"
+    img_root: str = r"/path/to/kadid10k"
+    dist_col: str = "dist_rgb"
+
+    # patch
+    crop_size: int = 384
+    K: int = 2  # CPU: 2 first, stable then 4
+
+    # structured sampling
+    p_same_type: float = 0.90
+
+    # train
+    device: str = "cpu"
+    batch_size: int = 2
+    num_workers: int = 0  # CPU/Windows stable
+    epochs: int = 60
+    freeze_epochs: int = 12  # freeze longer to avoid "unfreeze -> diverge"
+
+    lr_head: float = 2e-4
+    lr_backbone: float = 1e-5
+    weight_decay: float = 1e-4
+    accum_steps: int = 4
+
+    # epoch length control (because we sample pairs independent of idx)
+    steps_per_epoch: int = 1200
+    valid_steps: int = 300
+
+    # robust delta transform
+    delta_stat_samples: int = 20000
+    clip_p: Tuple[float, float] = (1.0, 99.0)
+    asinh_scale_eps: float = 1e-3
+
+    # labels (auto detect if None)
+    label_cols: Optional[List[str]] = None
+    label_dir: Optional[Dict[str, float]] = None
+    label_weights: Optional[Dict[str, float]] = None
+
+    # scheduler
+    use_plateau: bool = True
+    plateau_patience: int = 3
+    plateau_factor: float = 0.5
+    min_lr: float = 1e-7
+
+    # logging
+    use_tensorboard: bool = True
+    log_root: str = "log/delta_iqa_nv12_full"
+    ckpt_dir: str = "ckpt"
+    save_last_every_epoch: bool = True
+
+    # reproducibility
+    seed: int = 42
+
+
+# =========================
+# Utils
+# =========================
+def set_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+def safe_makedirs(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def stable_int_seed(s: str) -> int:
+    h = hashlib.md5(s.encode("utf-8")).hexdigest()
+    return int(h[:8], 16)
+
+def ensure_bgr(path: str):
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Failed to read image: {path}")
+    return img
+
+
+# =========================
+# KADID filename parser
+# I01_17_03.png -> ref_id=1, dist_type=17, level=3
+# =========================
+_kadid_re = re.compile(r"^I(\d+)_([0-9]+)_([0-9]+)$")
+
+def parse_kadid_name(path_or_name: str) -> Tuple[int, int, int]:
+    name = os.path.splitext(os.path.basename(str(path_or_name)))[0]
+    m = _kadid_re.match(name)
+    if m is None:
+        raise ValueError(f"Bad KADID name: {path_or_name} (expect Ixx_yy_zz.png)")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+# =========================
+# Auto-detect heads from CSV
+# =========================
+def default_heads_from_csv(df: pd.DataFrame):
+    cand = ["noise_y_sigma", "noise_uv_sigma", "ringing_y", "mos", "lpips", "dists"]
+    cols = []
+    for c in cand:
+        if c in df.columns:
+            x = pd.to_numeric(df[c], errors="coerce").values
+            if not np.all(np.isnan(x)):
+                cols.append(c)
+
+    # direction: +1 larger better, -1 smaller better
+    label_dir = {}
+    for c in cols:
+        if c == "mos":
+            label_dir[c] = +1.0
+        else:
+            label_dir[c] = -1.0
+
+    # weights: keep your priorities (noise/ringing primary, MOS weak)
+    label_weights = {}
+    for c in cols:
+        if c in ["noise_y_sigma", "noise_uv_sigma"]:
+            label_weights[c] = 1.0
+        elif c == "ringing_y":
+            label_weights[c] = 1.0
+        elif c in ["lpips", "dists"]:
+            label_weights[c] = 0.15   # guardrail (optional)
+        elif c == "mos":
+            label_weights[c] = 0.10   # weak supervision
+        else:
+            label_weights[c] = 1.0
+
+    return cols, label_dir, label_weights
+
+
+# =========================
+# Build structured groups for sampling
+# =========================
+def build_groups(df: pd.DataFrame, dist_col: str):
+    refs, types, levels = [], [], []
+    for p in df[dist_col].astype(str).tolist():
+        ref_id, t, lv = parse_kadid_name(p)
+        refs.append(ref_id); types.append(t); levels.append(lv)
+
+    df = df.copy()
+    df["_ref_id"] = refs
+    df["_type"] = types
+    df["_level"] = levels
+
+    ref_to_idxs: Dict[int, List[int]] = {}
+    ref_type_to_idxs: Dict[Tuple[int, int], List[int]] = {}
+    ref_to_types: Dict[int, set] = {}
+
+    for i, (r, t) in enumerate(zip(refs, types)):
+        ref_to_idxs.setdefault(r, []).append(i)
+        ref_type_to_idxs.setdefault((r, t), []).append(i)
+        ref_to_types.setdefault(r, set()).add(t)
+
+    # keep groups with >=2 samples
+    ref_to_idxs = {r: idxs for r, idxs in ref_to_idxs.items() if len(idxs) >= 2}
+    ref_type_to_idxs = {k: idxs for k, idxs in ref_type_to_idxs.items() if len(idxs) >= 2}
+    ref_to_types = {r: sorted(list(ts)) for r, ts in ref_to_types.items() if r in ref_to_idxs}
+    ref_list = sorted(ref_to_idxs.keys())
+    return df, ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list
+
+def split_by_ref(df: pd.DataFrame, seed: int, train_ratio=0.9):
+    uniq = df["_ref_id"].unique()
+    rng = np.random.RandomState(seed)
+    rng.shuffle(uniq)
+    n_tr = int(len(uniq) * train_ratio)
+    tr_set = set(uniq[:n_tr])
+    df_tr = df[df["_ref_id"].isin(tr_set)].copy()
+    df_va = df[~df["_ref_id"].isin(tr_set)].copy()
+    return df_tr, df_va
+
+def sample_pair_indices(rng: np.random.RandomState, cfg: CFG,
+                        ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list):
+    # pick a reference group
+    ref_id = ref_list[rng.randint(0, len(ref_list))]
+
+    # with prob p_same_type: sample within same distortion type
+    if rng.rand() < cfg.p_same_type:
+        cand_types = [t for t in ref_to_types[ref_id] if (ref_id, t) in ref_type_to_idxs]
+        if len(cand_types) > 0:
+            t = cand_types[rng.randint(0, len(cand_types))]
+            idxs = ref_type_to_idxs[(ref_id, t)]
+            a, b = rng.choice(idxs, size=2, replace=False)
+            return int(a), int(b)
+
+    # otherwise sample within same ref across types
+    idxs = ref_to_idxs[ref_id]
+    a, b = rng.choice(idxs, size=2, replace=False)
+    return int(a), int(b)
+
+
+# =========================
+# RGB -> NV12 simulate (BT.601 FULL) -> YUV3 tensor
+# =========================
+def bgr_to_nv12_bt601_full(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    rgb = bgr[..., ::-1].astype(np.float32)
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+
+    Y = 0.299 * R + 0.587 * G + 0.114 * B
+    U = -0.168736 * R - 0.331264 * G + 0.5 * B + 128.0
+    V = 0.5 * R - 0.418688 * G - 0.081312 * B + 128.0
+
+    Y = np.clip(Y, 0, 255).astype(np.uint8)
+    U = np.clip(U, 0, 255).astype(np.uint8)
+    V = np.clip(V, 0, 255).astype(np.uint8)
+
+    h, w = Y.shape
+    u_half = cv2.resize(U, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    v_half = cv2.resize(V, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+
+    uv = np.empty((h // 2, w), dtype=np.uint8)
+    uv[:, 0::2] = u_half
+    uv[:, 1::2] = v_half
+    return Y, uv
+
+def nv12_to_yuv3_tensor(Y_u8: np.ndarray, UV_u8: np.ndarray) -> torch.Tensor:
+    h, w = Y_u8.shape
+    u = UV_u8[:, 0::2]
+    v = UV_u8[:, 1::2]
+    u_full = cv2.resize(u, (w, h), interpolation=cv2.INTER_LINEAR)
+    v_full = cv2.resize(v, (w, h), interpolation=cv2.INTER_LINEAR)
+    x = np.stack([Y_u8, u_full, v_full], axis=0).astype(np.float32) / 255.0
+    return torch.from_numpy(x)  # (3,H,W)
+
+def random_crop_coords(rng: np.random.RandomState, h: int, w: int, crop: int):
+    if h < crop or w < crop:
+        y0 = max(0, (h - crop) // 2)
+        x0 = max(0, (w - crop) // 2)
+        y0 = min(y0, max(0, h - crop))
+        x0 = min(x0, max(0, w - crop))
+        return y0, x0
+    y0 = 0 if h == crop else rng.randint(0, h - crop + 1)
+    x0 = 0 if w == crop else rng.randint(0, w - crop + 1)
+    return y0, x0
+
+
+# =========================
+# Robust delta transform: clip + asinh + z-norm
+# =========================
+def transform_delta_raw(delta_raw: np.ndarray,
+                        clip_lo: np.ndarray, clip_hi: np.ndarray,
+                        asinh_scale: np.ndarray):
+    d = np.clip(delta_raw, clip_lo, clip_hi)
+    d = np.arcsinh(d / (asinh_scale + 1e-6))
+    return d
+
+def estimate_delta_stats(df_tr: pd.DataFrame, cfg: CFG,
+                         y_abs: np.ndarray,
+                         ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list):
+    rng = np.random.RandomState(cfg.seed + 123)
+    dirs = np.array([cfg.label_dir[c] for c in cfg.label_cols], np.float32)
+
+    deltas = []
+    for _ in tqdm(range(cfg.delta_stat_samples), desc="stat(delta)", leave=False):
+        a, b = sample_pair_indices(rng, cfg, ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list)
+        if rng.rand() < 0.5:
+            base_i, cand_i = a, b
+        else:
+            base_i, cand_i = b, a
+        d_raw = dirs * (y_abs[cand_i] - y_abs[base_i])
+        deltas.append(d_raw)
+
+    deltas = np.stack(deltas, axis=0)  # (N,heads)
+
+    lo_p, hi_p = cfg.clip_p
+    clip_lo = np.percentile(deltas, lo_p, axis=0).astype(np.float32)
+    clip_hi = np.percentile(deltas, hi_p, axis=0).astype(np.float32)
+
+    d_clip = np.clip(deltas, clip_lo, clip_hi)
+    asinh_scale = np.maximum(d_clip.std(axis=0), cfg.asinh_scale_eps).astype(np.float32)
+
+    d_tr = transform_delta_raw(deltas, clip_lo, clip_hi, asinh_scale)
+    mean = d_tr.mean(axis=0).astype(np.float32)
+    std = np.maximum(d_tr.std(axis=0), 1e-3).astype(np.float32)
+
+    return mean, std, clip_lo, clip_hi, asinh_scale
+
+
+# =========================
+# Dataset: structured pair sampling (train) + fixed pairs (valid)
+# =========================
+class DeltaPairDataset(Dataset):
+    """
+    Returns:
+      x_base: (K,3,H,W)
+      x_cand: (K,3,H,W)
+      d_norm: (heads,) normalized transformed delta target
+      d_tr  : (heads,) transformed delta target (for MAE display)
+    """
+    def __init__(self,
+                 df: pd.DataFrame,
+                 cfg: CFG,
+                 ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list,
+                 delta_mean, delta_std, clip_lo, clip_hi, asinh_scale,
+                 train: bool,
+                 fixed_pairs: Optional[List[Tuple[int,int,int]]] = None):
+        self.df = df.reset_index(drop=True)
+        self.cfg = cfg
+        self.train = train
+
+        self.paths = self.df[cfg.dist_col].astype(str).tolist()
+        self.y_abs = self.df[cfg.label_cols].astype(np.float32).values
+        self.dirs = np.array([cfg.label_dir[c] for c in cfg.label_cols], np.float32)
+
+        self.ref_to_idxs = ref_to_idxs
+        self.ref_type_to_idxs = ref_type_to_idxs
+        self.ref_to_types = ref_to_types
+        self.ref_list = ref_list
+
+        self.delta_mean = delta_mean.astype(np.float32)
+        self.delta_std = delta_std.astype(np.float32)
+        self.clip_lo = clip_lo.astype(np.float32)
+        self.clip_hi = clip_hi.astype(np.float32)
+        self.asinh_scale = asinh_scale.astype(np.float32)
+
+        self.rng = np.random.RandomState(cfg.seed + (0 if train else 999))
+
+        # fixed pairs for stable validation (list of (base_i, cand_i, seed))
+        self.fixed_pairs = fixed_pairs
+
+        # virtual length
+        self._len = (cfg.steps_per_epoch * cfg.batch_size) if train else (cfg.valid_steps * cfg.batch_size)
+
+    def __len__(self):
+        if self.fixed_pairs is not None:
+            return len(self.fixed_pairs)
+        return self._len
+
+    def _load_k_patches_yuv(self, img_path: str, coords: List[Tuple[int,int]]):
+        bgr_full = ensure_bgr(img_path)
+        if self.train and self.rng.rand() < 0.5:
+            bgr_full = cv2.flip(bgr_full, 1)
+
+        xs = []
+        for (y0, x0) in coords:
+            patch = bgr_full[y0:y0+self.cfg.crop_size, x0:x0+self.cfg.crop_size]
+            Y, UV = bgr_to_nv12_bt601_full(patch)
+            x = nv12_to_yuv3_tensor(Y, UV)  # (3,H,W) in [0,1]
+            xs.append(x)
+        return torch.stack(xs, dim=0)  # (K,3,H,W)
+
+    def __getitem__(self, idx: int):
+        if self.fixed_pairs is not None:
+            base_i, cand_i, seed = self.fixed_pairs[idx]
+            rng_local = np.random.RandomState(seed)
+        else:
+            rng_local = self.rng
+            a, b = sample_pair_indices(rng_local, self.cfg,
+                                       self.ref_to_idxs, self.ref_type_to_idxs,
+                                       self.ref_to_types, self.ref_list)
+            if rng_local.rand() < 0.5:
+                base_i, cand_i = a, b
+            else:
+                base_i, cand_i = b, a
+
+        base_rel = self.paths[base_i]
+        cand_rel = self.paths[cand_i]
+        base_path = base_rel if os.path.isabs(base_rel) else os.path.join(self.cfg.img_root, base_rel)
+        cand_path = cand_rel if os.path.isabs(cand_rel) else os.path.join(self.cfg.img_root, cand_rel)
+
+        # shared crop coords
+        bgr0 = ensure_bgr(base_path)
+        h, w = bgr0.shape[:2]
+        coords = [random_crop_coords(rng_local, h, w, self.cfg.crop_size) for _ in range(self.cfg.K)]
+
+        x_base = self._load_k_patches_yuv(base_path, coords)
+        x_cand = self._load_k_patches_yuv(cand_path, coords)
+
+        # delta target in "improve direction": dirs*(cand-base)
+        d_raw = self.dirs * (self.y_abs[cand_i] - self.y_abs[base_i])  # (heads,)
+
+        # robust transform + norm
+        d_tr = transform_delta_raw(d_raw, self.clip_lo, self.clip_hi, self.asinh_scale)
+        d_norm = (d_tr - self.delta_mean) / (self.delta_std + 1e-6)
+
+        return x_base, x_cand, torch.from_numpy(d_norm.astype(np.float32)), torch.from_numpy(d_tr.astype(np.float32))
+
+
+def build_fixed_valid_pairs(cfg: CFG, ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list, n_pairs: int):
+    rng = np.random.RandomState(cfg.seed + 2027)
+    pairs = []
+    for i in range(n_pairs):
+        a, b = sample_pair_indices(rng, cfg, ref_to_idxs, ref_type_to_idxs, ref_to_types, ref_list)
+        base_i, cand_i = (a, b) if (rng.rand() < 0.5) else (b, a)
+        pairs.append((base_i, cand_i, int(rng.randint(0, 2**31-1))))
+    return pairs
+
+
+# =========================
+# Model: Siamese + MIL pooling
+# =========================
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+class YUVAdapter(nn.Module):
+    """
+    small learnable mapping from (Y,U,V) in [0,1] to a 3ch space ResNet can digest
+    """
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 3, kernel_size=1, bias=True)
+        self.bn = nn.BatchNorm2d(3)
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            self.conv.bias.zero_()
+            for c in range(3):
+                self.conv.weight[c, c, 0, 0] = 1.0
+
+    def forward(self, x):
+        x = self.bn(self.conv(x))
+        return torch.sigmoid(x)  # keep in [0,1]
+
+class SiameseDeltaIQA(nn.Module):
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.adapter = YUVAdapter()
+
+        bb = resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
+        bb.fc = nn.Identity()
+        self.backbone = bb  # 2048 feat
+
+        self.fuse = nn.Sequential(
+            nn.Linear(2048 * 4, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(1024, num_heads),
+        )
+
+    def _encode(self, xk):
+        # xk: (B,K,3,H,W)
+        B, K, C, H, W = xk.shape
+        x = xk.view(B * K, C, H, W)
+
+        x = self.adapter(x)
+
+        mean = IMAGENET_MEAN.to(x.device)
+        std = IMAGENET_STD.to(x.device)
+        x = (x - mean) / std
+
+        f = self.backbone(x)         # (B*K,2048)
+        f = f.view(B, K, -1).mean(1) # MIL mean pooling
+        return f
+
+    def forward(self, xb, xc):
+        fb = self._encode(xb)
+        fc = self._encode(xc)
+        d = fc - fb
+        feat = torch.cat([fc, fb, d, torch.abs(d)], dim=1)
+        return self.fuse(feat)  # (B,heads) normalized delta space
+
+
+def freeze_bn(module: nn.Module):
+    # important when batch small / CPU: keep BN in eval to stabilize
+    for m in module.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+
+def set_backbone_trainable(model: SiameseDeltaIQA, mode: str):
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+
+    if mode == "freeze_all":
+        return
+    if mode == "unfreeze_layer4":
+        for p in model.backbone.layer4.parameters():
+            p.requires_grad = True
+        return
+    if mode == "unfreeze_top":
+        for p in model.backbone.layer3.parameters():
+            p.requires_grad = True
+        for p in model.backbone.layer4.parameters():
+            p.requires_grad = True
+        return
+    if mode == "unfreeze_all":
+        for p in model.backbone.parameters():
+            p.requires_grad = True
+        return
+    raise ValueError(mode)
+
+def build_optimizer(model: SiameseDeltaIQA, cfg: CFG):
+    pg_head = list(model.adapter.parameters()) + list(model.fuse.parameters())
+    pg_bb = [p for p in model.backbone.parameters() if p.requires_grad]
+    params = [{"params": pg_head, "lr": cfg.lr_head}]
+    if len(pg_bb) > 0:
+        params
